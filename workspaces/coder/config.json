@@ -1,0 +1,8 @@
+{
+  "tools": {
+    "exec": {
+      "enable": true,
+      "pathAppend": "/usr/local/bin:/opt/homebrew/bin:~/.local/bin"
+    }
+  }
+}

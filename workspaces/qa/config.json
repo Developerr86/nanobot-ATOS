@@ -1,0 +1,14 @@
+{
+  "tools": {
+    "exec": {
+      "enable": true,
+      "pathAppend": "/usr/local/bin:/opt/homebrew/bin:~/.local/bin"
+    },
+    "read_file": {
+      "enable": true
+    },
+    "list_dir": {
+      "enable": true
+    }
+  }
+}
