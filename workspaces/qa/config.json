@@ -9,6 +9,9 @@
     },
     "list_dir": {
       "enable": true
+    },
+    "message":{
+      "enable" : false
     }
   }
 }

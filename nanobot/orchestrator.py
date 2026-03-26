@@ -1,12 +1,16 @@
 """
 orchestrator.py — Intent-Centric Multi-Agent Pipeline Orchestrator
 
-Routes user intents through the @architect → @coder → @qa triad via nanobot's
-internal MessageBus. Each agent runs its own isolated AgentLoop bound to its
-own workspace and config.
+State machine:
+  PLANNING  — @architect is in a live chat loop with the user.
+  EXECUTING — <FINAL_SPEC> detected; @coder and @qa run in the background.
+
+Each agent has its own isolated AgentLoop and MessageBus.
+The @architect maintains conversation history via session_key, so it
+remembers the full planning dialogue across multiple user messages.
 
 Usage:
-    python -m nanobot.orchestrator --config ~/.nanobot/config.json
+    python -m nanobot.orchestrator [~/.nanobot/config.json]
 """
 
 from __future__ import annotations
@@ -27,12 +31,16 @@ from nanobot.config.schema import Config, ExecToolConfig
 
 
 # ---------------------------------------------------------------------------
-# Verdict detection helpers
+# Regex patterns
 # ---------------------------------------------------------------------------
 
+_FINAL_SPEC_RE = re.compile(
+    r"<FINAL_SPEC>(.*?)</FINAL_SPEC>", re.DOTALL | re.IGNORECASE
+)
 _APPROVE_RE = re.compile(r"\bVERDICT\s*:\s*APPROVE\b", re.IGNORECASE)
-_REJECT_RE = re.compile(r"\bVERDICT\s*:\s*REJECT\b", re.IGNORECASE)
-_MAX_QA_LOOPS = 3  # maximum coder→qa cycles before escalating
+_REJECT_RE  = re.compile(r"\bVERDICT\s*:\s*REJECT\b",  re.IGNORECASE)
+
+_MAX_QA_LOOPS = 3  # maximum coder→qa cycles before escalating to human
 
 
 # ---------------------------------------------------------------------------
@@ -46,24 +54,22 @@ def _build_agent(
     bus: MessageBus,
     workspace_config_path: Path | None = None,
 ) -> AgentLoop:
-    """Construct an AgentLoop for one of the three pipeline agents."""
+    """Construct an AgentLoop for one pipeline agent."""
     cfg = base_config
 
-    # Merge per-workspace config.json overrides if present
+    exec_cfg = cfg.tools.exec  # default
     if workspace_config_path and workspace_config_path.exists():
         with open(workspace_config_path, encoding="utf-8") as f:
             overrides = json.load(f)
-        # Apply exec overrides
         exec_overrides = overrides.get("tools", {}).get("exec", {})
         exec_cfg = ExecToolConfig(
             timeout=exec_overrides.get("timeout", cfg.tools.exec.timeout),
-            path_append=exec_overrides.get("pathAppend", cfg.tools.exec.path_append),
+            path_append=exec_overrides.get(
+                "pathAppend", exec_overrides.get("path_append", cfg.tools.exec.path_append)
+            ),
         )
-    else:
-        exec_cfg = cfg.tools.exec
 
-    # Build the LLM provider (reuse base config credentials)
-    from nanobot.cli.commands import _make_provider  # shared factory
+    from nanobot.cli.commands import _make_provider
     provider = _make_provider(cfg)
 
     agent = AgentLoop(
@@ -89,11 +95,18 @@ def _build_agent(
 
 class PipelineOrchestrator:
     """
-    Coordinates the @architect → @coder → @qa pipeline.
+    State-aware orchestrator for the @architect → @coder ↔ @qa pipeline.
 
-    Each agent has its own isolated AgentLoop + workspace.  A shared
-    *event bus* carries the hand-off payloads between stages; a separate
-    *user bus* connects to the inbound Discord/WhatsApp channel messages.
+    State per session:
+        PLANNING   — messages are forwarded directly to @architect for
+                     conversational refinement.  The architect's responses
+                     are echoed back to the user.
+        EXECUTING  — the <FINAL_SPEC> tag was detected; @coder and @qa are
+                     running in the background.  Incoming user messages
+                     during this phase receive a "working…" notice.
+
+    Session keys are derived from the inbound message's channel + chat_id so
+    that each unique user/conversation gets its own isolated architect thread.
     """
 
     def __init__(
@@ -101,27 +114,23 @@ class PipelineOrchestrator:
         base_config_path: Path,
         repo_root: Path,
         on_status: Callable[[str, str, str], Awaitable[None]] | None = None,
-    ):
-        """
-        Args:
-            base_config_path: Path to the main nanobot config.json with API keys.
-            repo_root:        Root of the nanobot repo (contains workspaces/).
-            on_status:        Optional async callback(agent, event_type, message)
-                              called for every significant pipeline event (used by TUI).
-        """
+    ) -> None:
         self.base_config_path = base_config_path
         self.repo_root = repo_root
         self.on_status = on_status
 
-        # One bus per agent — prevents cross-agent message bleed
-        self._user_bus = MessageBus()       # inbound from channels
-        self._arch_bus = MessageBus()       # architect internal bus
-        self._coder_bus = MessageBus()      # coder internal bus
-        self._qa_bus = MessageBus()         # qa internal bus
+        # Per-session state: session_key → "planning" | "executing"
+        self._session_state: dict[str, str] = {}
 
-        cfg = load_config(base_config_path)
+        # One bus per agent — no cross-agent message bleed
+        self._user_bus  = MessageBus()
+        self._arch_bus  = MessageBus()
+        self._coder_bus = MessageBus()
+        self._qa_bus    = MessageBus()
 
-        ws_root = repo_root / "workspaces"
+        cfg      = load_config(base_config_path)
+        ws_root  = repo_root / "workspaces"
+
         self._architect = _build_agent(
             "architect",
             ws_root / "architect",
@@ -148,12 +157,18 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
 
     async def _emit(self, agent: str, event_type: str, message: str) -> None:
-        """Fire the status callback (non-blocking, swallows errors)."""
+        """Fire the TUI / monitoring callback (swallows errors)."""
         if self.on_status:
             try:
                 await self.on_status(agent, event_type, message)
             except Exception:
                 pass
+
+    async def _reply(self, channel: str, chat_id: str, content: str) -> None:
+        """Publish a message back to the user's originating channel."""
+        await self._user_bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=content)
+        )
 
     async def _call_agent(
         self,
@@ -162,7 +177,7 @@ class PipelineOrchestrator:
         prompt: str,
         session_key: str,
     ) -> str:
-        """Run a single prompt through an agent and return its response."""
+        """Run one prompt through an agent and return the response string."""
         await self._emit(agent_name, "start", prompt[:120])
         response = await agent_loop.process_direct(
             content=prompt,
@@ -175,30 +190,35 @@ class PipelineOrchestrator:
         return response or ""
 
     # ------------------------------------------------------------------
-    # Pipeline stages
+    # Stage: Architect (conversational)
     # ------------------------------------------------------------------
 
-    async def _stage_architect(self, user_intent: str) -> str:
-        """Stage 1: Produce an architectural specification from the user intent."""
-        prompt = (
-            "You are @architect. Analyse the following user intent and produce a "
-            "complete, unambiguous architectural specification that the @coder can "
-            "execute without further clarification.\n\n"
-            f"USER INTENT:\n{user_intent}"
+    async def _stage_architect(self, user_message: str, session_key: str) -> str:
+        """
+        Forward the user's message directly to @architect, preserving the
+        full conversation history via session_key.
+
+        The AGENTS.md persona handles all prompt logic — we pass the raw
+        user message with no wrapper.
+        """
+        return await self._call_agent(
+            self._architect,
+            "@architect",
+            user_message,
+            session_key,          # ← real session key keeps history alive
         )
-        spec = await self._call_agent(
-            self._architect, "@architect", prompt, "pipeline:architect"
-        )
-        logger.info("@architect spec produced ({} chars)", len(spec))
-        return spec
+
+    # ------------------------------------------------------------------
+    # Stages: Coder and QA (execution, non-interactive)
+    # ------------------------------------------------------------------
 
     async def _stage_coder(self, spec: str, iteration: int) -> str:
-        """Stage 2: Implement the spec using OpenCode CLI."""
+        """Stage 2: Implement the finalised spec via OpenCode CLI."""
         prompt = (
-            "You are @coder. Read `skills/opencode/SKILL.md` first, then use the "
-            "`exec` tool to invoke the appropriate `opencode` commands to implement "
-            "the following architectural specification. Report the output file paths "
-            "and exit status when done.\n\n"
+            "Read `skills/opencode/SKILL.md` first. Then use the `exec` tool to "
+            "invoke the appropriate `opencode` commands to implement the following "
+            "architectural specification exactly as written. Report the generated "
+            "file paths and exit status when done. Do not ask questions.\n\n"
             f"ARCHITECTURAL SPECIFICATION:\n{spec}"
         )
         result = await self._call_agent(
@@ -208,14 +228,14 @@ class PipelineOrchestrator:
         return result
 
     async def _stage_qa(self, coder_output: str, spec: str, iteration: int) -> str:
-        """Stage 3: Run QA against the coder output."""
+        """Stage 3: Run QA gate against the coder output."""
         prompt = (
-            "You are @qa. Read `skills/quality-assurance/SKILL.md` first. Then "
-            "evaluate the build described below against the original spec. Run all "
-            "lint and test commands via the `exec` tool. Inspect key files with "
-            "`read_file`. Output exactly one VERDICT: APPROVE or VERDICT: REJECT "
-            "with details.\n\n"
-            f"ORIGINAL SPEC:\n{spec}\n\n"
+            "Read `skills/quality-assurance/SKILL.md` first. Evaluate the build "
+            "below against the original specification. Run all lint and test "
+            "commands via `exec`. Inspect key files with `read_file`. Output "
+            "exactly one VERDICT: APPROVE or VERDICT: REJECT with a structured "
+            "bug report. Do not ask questions.\n\n"
+            f"ORIGINAL SPECIFICATION:\n{spec}\n\n"
             f"CODER OUTPUT / FILE PATHS:\n{coder_output}"
         )
         verdict = await self._call_agent(
@@ -225,63 +245,77 @@ class PipelineOrchestrator:
         return verdict
 
     # ------------------------------------------------------------------
-    # Main pipeline driver
+    # Background execution pipeline (coder ↔ qa loop)
     # ------------------------------------------------------------------
 
-    async def _run_pipeline(self, user_intent: str, reply_channel: str, reply_chat_id: str) -> None:
-        """Execute the full architect → coder ⟷ qa loop for one user intent."""
-        await self._emit("orchestrator", "start", f"Pipeline started for: {user_intent[:80]}")
+    async def _run_execution_pipeline(
+        self,
+        spec: str,
+        reply_channel: str,
+        reply_chat_id: str,
+        session_key: str,
+    ) -> None:
+        """
+        Run the coder ↔ qa loop in the background.
+        Called via asyncio.create_task so the event loop stays non-blocking.
+        Clears the session's EXECUTING state when done so the user can start
+        a new planning session.
+        """
+        try:
+            await self._emit(
+                "orchestrator", "executing",
+                f"Execution pipeline started for session {session_key}"
+            )
 
-        # Stage 1: Architect
-        spec = await self._stage_architect(user_intent)
+            for iteration in range(1, _MAX_QA_LOOPS + 1):
+                coder_output = await self._stage_coder(spec, iteration)
+                qa_output    = await self._stage_qa(coder_output, spec, iteration)
 
-        # Stage 2/3: Coder ↔ QA loop
-        for iteration in range(1, _MAX_QA_LOOPS + 1):
-            coder_output = await self._stage_coder(spec, iteration)
-            qa_output = await self._stage_qa(coder_output, spec, iteration)
+                if _APPROVE_RE.search(qa_output):
+                    await self._emit("orchestrator", "approved", qa_output[:200])
+                    await self._reply(
+                        reply_channel, reply_chat_id,
+                        f"✅ Build approved after {iteration} iteration(s).\n\nQA Report:\n{qa_output}",
+                    )
+                    return
 
-            if _APPROVE_RE.search(qa_output):
-                await self._emit("orchestrator", "approved", qa_output[:200])
-                final_msg = (
-                    f"✅ Build approved after {iteration} iteration(s).\n\n"
-                    f"QA Report:\n{qa_output}"
-                )
-                await self._user_bus.publish_outbound(OutboundMessage(
-                    channel=reply_channel, chat_id=reply_chat_id, content=final_msg,
-                ))
-                return
+                if _REJECT_RE.search(qa_output):
+                    await self._emit(
+                        "orchestrator", "rejected",
+                        f"Iteration {iteration}: {qa_output[:200]}"
+                    )
+                    if iteration == _MAX_QA_LOOPS:
+                        break
+                    # Append the bug report to the spec for the next coder pass
+                    spec = (
+                        f"{spec}\n\n"
+                        f"--- QA REJECTION (iteration {iteration}) ---\n{qa_output}"
+                    )
+                else:
+                    await self._emit("orchestrator", "ambiguous", qa_output[:200])
 
-            if _REJECT_RE.search(qa_output):
-                await self._emit("orchestrator", "rejected", f"Iteration {iteration}: {qa_output[:200]}")
-                if iteration == _MAX_QA_LOOPS:
-                    break
-                # Feed the bug report back into the spec for the next coder pass
-                spec = f"{spec}\n\n--- QA REJECTION (iteration {iteration}) ---\n{qa_output}"
-            else:
-                # Ambiguous output — treat as failure
-                await self._emit("orchestrator", "ambiguous", qa_output[:200])
-
-        # Exhausted retries
-        await self._user_bus.publish_outbound(OutboundMessage(
-            channel=reply_channel,
-            chat_id=reply_chat_id,
-            content=(
+            # Exhausted retries
+            await self._reply(
+                reply_channel, reply_chat_id,
                 f"❌ Pipeline could not pass QA after {_MAX_QA_LOOPS} iteration(s). "
-                "Escalating for human review."
-            ),
-        ))
-        await self._emit("orchestrator", "escalated", "Max QA loops reached")
+                "Escalating for human review.",
+            )
+            await self._emit("orchestrator", "escalated", "Max QA loops reached")
+
+        finally:
+            # Return session to PLANNING so the user can iterate further
+            self._session_state[session_key] = "planning"
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Main event loop
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
         """
-        Start the orchestrator event loop.
+        Listen on the user bus and route each message through the state machine.
 
-        Listens on the user bus for inbound messages (published by channel
-        adapters) and dispatches each intent through the pipeline.
+        PLANNING  → forward to @architect; check response for <FINAL_SPEC>.
+        EXECUTING → send a "still working" notice; ignore message body.
         """
         logger.info("Orchestrator started — listening for intents")
         await self._emit("orchestrator", "ready", "Listening for intents")
@@ -296,11 +330,58 @@ class PipelineOrchestrator:
             except asyncio.CancelledError:
                 break
 
-            # Fire pipeline as a background task so the loop stays responsive
-            asyncio.create_task(
-                self._run_pipeline(msg.content, msg.channel, msg.chat_id),
-                name=f"pipeline:{msg.session_key}",
-            )
+            # Derive a stable session key from the user's channel + chat_id
+            session_key = f"architect:{msg.channel}:{msg.chat_id}"
+            state = self._session_state.get(session_key, "planning")
+
+            if state == "executing":
+                # Don't interrupt a running build — inform and move on
+                await self._reply(
+                    msg.channel, msg.chat_id,
+                    "⏳ Your build is still running. I'll notify you when it's done.",
+                )
+                continue
+
+            # ── PLANNING state ──────────────────────────────────────────────
+            arch_response = await self._stage_architect(msg.content, session_key)
+
+            # Check for the <FINAL_SPEC> trigger
+            match = _FINAL_SPEC_RE.search(arch_response)
+            if match:
+                spec = match.group(1).strip()
+                logger.info(
+                    "FINAL_SPEC detected ({} chars) — delegating to @coder/@qa",
+                    len(spec),
+                )
+
+                # Mark session as executing BEFORE spawning the task
+                self._session_state[session_key] = "executing"
+
+                # Acknowledge to the user
+                await self._reply(
+                    msg.channel, msg.chat_id,
+                    "✅ Plan approved. Delegating execution to @coder and @qa...\n"
+                    "I'll message you here when the build is complete.",
+                )
+
+                # Fire execution in the background — does not block the event loop
+                asyncio.create_task(
+                    self._run_execution_pipeline(
+                        spec=spec,
+                        reply_channel=msg.channel,
+                        reply_chat_id=msg.chat_id,
+                        session_key=session_key,
+                    ),
+                    name=f"exec:{session_key}",
+                )
+
+            else:
+                # Still in planning — echo architect's reply directly to the user
+                await self._reply(msg.channel, msg.chat_id, arch_response)
+
+    # ------------------------------------------------------------------
+    # Public surface
+    # ------------------------------------------------------------------
 
     @property
     def user_bus(self) -> MessageBus:
@@ -313,15 +394,26 @@ class PipelineOrchestrator:
 # ---------------------------------------------------------------------------
 
 async def _main(config_path: str) -> None:
-    repo_root = Path(__file__).parent.parent.resolve()  # nanobot/ → repo root
+    cfg_path = Path(config_path)
+    repo_root = Path(__file__).parent.parent.resolve()
+
     orchestrator = PipelineOrchestrator(
-        base_config_path=Path(config_path),
+        base_config_path=cfg_path,
         repo_root=repo_root,
     )
+
+    from nanobot.channels.manager import ChannelManager
+    cfg = load_config(cfg_path)
+    channel_manager = ChannelManager(config=cfg, bus=orchestrator.user_bus)
+    asyncio.create_task(channel_manager.start_all())
+
     await orchestrator.run()
 
 
 if __name__ == "__main__":
     import sys
-    cfg = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / ".nanobot" / "config.json")
-    asyncio.run(_main(cfg))
+    cfg_arg = (
+        sys.argv[1] if len(sys.argv) > 1
+        else str(Path.home() / ".nanobot" / "config.json")
+    )
+    asyncio.run(_main(cfg_arg))
