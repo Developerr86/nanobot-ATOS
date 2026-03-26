@@ -24,3 +24,4 @@ nano.*.save
 .DS_Store
 uv.lock
 cli_pipeline.jsonl
+node_modules/
