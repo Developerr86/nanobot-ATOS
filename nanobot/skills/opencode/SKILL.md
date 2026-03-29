@@ -70,3 +70,12 @@ For an AI Agent specifically building code, the most relevant commands are:
 2. The agent must pass the architectural context into the `opencode run` or `opencode generate` prompts.
 3. The agent must rely on the terminal output of these commands to verify success or failure.
 4. The agent must report the final status to the `@qa` agent.
+
+## Fallback Protocol
+If `opencode` commands fail (non-zero exit code, command not found, timeout, or errors in output):
+
+1. **Detect failure**: Check exit codes and error messages from `exec` output.
+2. **Switch to manual mode**: Use `write_file`, `read_file`, and `list_dir` tools to build the project directly.
+3. **Follow the spec**: Parse the architectural specification and implement each component manually.
+4. **Report fallback**: Prefix your status report with `[FALLBACK MODE]` so `@qa` knows manual generation was used.
+5. **No excuses**: A failed opencode command is not a reason to abort - the agent must complete the task manually.

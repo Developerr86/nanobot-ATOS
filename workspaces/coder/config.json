@@ -4,8 +4,17 @@
       "enable": true,
       "pathAppend": "/usr/local/bin:/opt/homebrew/bin:~/.local/bin:~/.local/share/opencode/bin:~/AppData/Roaming/npm"
     },
+    "write_file": {
+      "enable": true
+    },
+    "read_file": {
+      "enable": true
+    },
+    "list_dir": {
+      "enable": true
+    },
     "message": {
-      "enable": false 
+      "enable": false
     }
   }
 }

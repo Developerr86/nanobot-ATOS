@@ -261,7 +261,7 @@ class AgentLoop:
 
         while self._running:
             try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=4.0)
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
