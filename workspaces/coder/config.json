@@ -2,7 +2,7 @@
   "tools": {
     "exec": {
       "enable": true,
-      "pathAppend": "/usr/local/bin:/opt/homebrew/bin:~/.local/bin"
+      "pathAppend": "/usr/local/bin:/opt/homebrew/bin:~/.local/bin:~/.local/share/opencode/bin:~/AppData/Roaming/npm"
     },
     "message": {
       "enable": false 

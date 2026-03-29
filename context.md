@@ -266,3 +266,66 @@ python -m nanobot.orchestrator ~/.nanobot/config.json
 ```
 
 > `rich` is already listed as a dependency in `pyproject.toml` via the nanobot CLI. No new packages required.
+
+---
+
+### Phase 5: Interactive Architect & State Routing (Complete)
+
+**Goal:** Transform the pipeline into a conversational design process where the `@architect` acts as a Lead Engineer, only triggering execution upon explicit user approval of a `<FINAL_SPEC>`.
+
+#### Key Architecture Changes (`orchestrator.py`)
+- **Per-Session State Machine**: Each conversation (session) now tracks its state: `PLANNING` or `EXECUTING`.
+- **Interactive Planning**: The orchestrator forwards messages to `@architect` and replies back to the user until a spec is finalized.
+- **Trigger Mechanism**: The pipeline monitors `@architect` responses for a `<FINAL_SPEC>` XML tag. Once detected, the session switches to `EXECUTING`.
+- **Background Execution**: The `_run_execution_pipeline` (Coder ↔ QA loop) is spawned as a non-blocking `asyncio.task`, allowing the orchestrator to stay responsive to other messages.
+
+#### Persona Updates
+- **`workspaces/architect/AGENTS.md`**: New instructions for the Architect to be collaborative, ask clarifying questions, and wrap finalized plans in `<FINAL_SPEC>` tags.
+- **Lockdown**: `workspaces/coder/config.json` and `workspaces/qa/config.json` have the `message` tool disabled (`"enable": false`) to prevent them from attempting to converse with the user.
+
+---
+
+### Phase 6: Interactive Frontend & API Bridge (Complete)
+
+**Goal:** Build a modern, web-based interface for the pipeline with a clean, minimal "editorial" aesthetic.
+
+#### 1. FastAPI Backend Bridge (`nanobot/api_server.py`)
+- **REST APIs**:
+    - `/api/system/check-opencode`: Robust detection using `shutil.which` and fallback locations (fixed for Windows).
+    - `/api/system/install-opencode`: Proxy that streams `npm install` logs to the frontend.
+    - `/api/config`: Full read/write access to `~/.nanobot/config.json`.
+- **WebSockets**:
+    - `/ws/chat`: Bidirectional bridge between the React UI and the Orchestrator's `user_bus`.
+    - `/ws/events`: Broadcasts internal status events to the frontend's Event Ticker.
+
+#### 2. React/Vite Frontend (`frontend/`)
+- **Minimalist Aesthetic**: 
+    - **Colors**: Strict Black & White / Grayscale. No gradients.
+    - **Typography**: Serif fonts (**EB Garamond** for body, **Playfair Display** for headings).
+    - **UI Library**: Custom Vanilla CSS design system (`index.css`) with zero border-radius and sharp borders.
+- **Key Views**:
+    - **Onboarding**: 2-step flow for environment validation and configuration.
+    - **Chat View**: Conversational interface with the Architect + **EventTicker** sidebar for live monitoring.
+    - **Settings**: Structured UI components for editing all `config.json` fields (Providers, API Keys, Channels, Tools).
+
+#### 3. Critical Bug Fixes & Optimizations
+- **Monitoring Fix**: Resolved a core bug in `nanobot/agent/loop.py` where progress events were silently dropped for system-channel messages, which previously caused the TUI and Frontend EventTicker to stay blank.
+- **Windows Parity**: 
+    - Fixed `opencode` detection (`opencode.cmd`).
+    - Updated `pathAppend` in `@coder` and `@qa` workspaces to include `~/.local/share/opencode/bin` and Windows `%APPDATA%\npm`.
+- **UX Fixes**: Corrected viewport clipping and scrolling behavior in the onboarding and chat views.
+
+---
+
+## 🚀 Running the Full Stack
+
+```bash
+# 1. Start the Backend (API Server)
+python -m nanobot.api_server
+
+# 2. Start the Frontend (Vite)
+cd frontend
+npm install
+npm run dev
+# Open http://localhost:5173
+```

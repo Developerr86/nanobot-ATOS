@@ -121,17 +121,33 @@ async def _startup() -> None:
 
 @app.get("/api/system/check-opencode")
 async def check_opencode() -> dict[str, Any]:
-    """Check whether the opencode CLI is available on PATH."""
+    """Check whether the opencode CLI is available on PATH or in standard fallback locations."""
+    import shutil
+    import sys
+    import os
+    
+    opencode_exe = "opencode.cmd" if sys.platform == "win32" else "opencode"
+    opencode_path = shutil.which("opencode")
+    
+    if not opencode_path:
+        alt_path = Path.home() / ".local" / "share" / "opencode" / "bin" / opencode_exe
+        if alt_path.exists():
+            opencode_path = str(alt_path)
+            
+    if not opencode_path:
+        return {"available": False, "version": ""}
+
     try:
         result = subprocess.run(
-            ["opencode", "--version"],
+            [opencode_path, "--version"],
             capture_output=True, text=True, timeout=10,
         )
         available = result.returncode == 0
         version   = result.stdout.strip() or result.stderr.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         available = False
         version   = ""
+        
     return {"available": available, "version": version}
 
 

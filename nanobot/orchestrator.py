@@ -179,12 +179,19 @@ class PipelineOrchestrator:
     ) -> str:
         """Run one prompt through an agent and return the response string."""
         await self._emit(agent_name, "start", prompt[:120])
+
+        # on_progress must be a true async callable matching the signature
+        # Callable[[str], Awaitable[None]] — tool_hint kwarg is forwarded too.
+        async def _on_progress(text: str, *, tool_hint: bool = False) -> None:
+            snippet = f"[tool] {text}" if tool_hint else text
+            await self._emit(agent_name, "progress", snippet[:200])
+
         response = await agent_loop.process_direct(
             content=prompt,
             session_key=session_key,
             channel="system",
             chat_id="pipeline",
-            on_progress=lambda text, **_: self._emit(agent_name, "progress", text),
+            on_progress=_on_progress,
         )
         await self._emit(agent_name, "done", (response or "")[:200])
         return response or ""
