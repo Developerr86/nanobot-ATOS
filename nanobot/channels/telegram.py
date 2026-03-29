@@ -175,6 +175,8 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("reset", "Reset session context"),
+        BotCommand("compact", "Compact session memory"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
@@ -240,6 +242,9 @@ class TelegramChannel(BaseChannel):
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("reset", self._forward_command))
+        self._app.add_handler(CommandHandler("compact", self._forward_command))
+        self._app.add_handler(CommandHandler("workspace", self._forward_command_with_args))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
@@ -636,6 +641,23 @@ class TelegramChannel(BaseChannel):
             sender_id=self._sender_id(user),
             chat_id=str(message.chat_id),
             content=message.text or "",
+            metadata=self._build_message_metadata(message, user),
+            session_key=self._derive_topic_session_key(message),
+        )
+
+    async def _forward_command_with_args(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Forward commands with optional arguments (e.g., /workspace /path/to/dir)."""
+        if not update.message or not update.effective_user:
+            return
+        message = update.message
+        user = update.effective_user
+        self._remember_thread_context(message)
+        # Extract full command line including arguments
+        text = message.text or ""
+        await self._handle_message(
+            sender_id=self._sender_id(user),
+            chat_id=str(message.chat_id),
+            content=text,
             metadata=self._build_message_metadata(message, user),
             session_key=self._derive_topic_session_key(message),
         )

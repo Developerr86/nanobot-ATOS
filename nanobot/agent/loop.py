@@ -406,10 +406,75 @@ class AgentLoop:
 
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
+        if cmd == "/reset":
+            # /reset: Clear session context entirely and start fresh
+            snapshot = session.messages[session.last_consolidated:]
+            session.clear()
+            self.sessions.save(session)
+            self.sessions.invalidate(session.key)
+
+            if snapshot:
+                self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
+
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="✨ Session reset. Starting fresh with a clear context window.")
+        if cmd == "/compact":
+            # /compact: Force consolidation of current session context before continuing
+            snapshot = session.messages[session.last_consolidated:]
+            if snapshot:
+                await self.memory_consolidator.archive_messages(snapshot)
+                session.last_consolidated = len(session.messages)
+                self.sessions.save(session)
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="📦 Context compacted. Session consolidated and ready for new conversation.")
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="📦 Nothing to compact. Session already clean.")
+
+        # Check for /workspace command with optional path argument
+        if cmd.startswith("/workspace"):
+            parts = msg.content.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                # /workspace [path]
+                new_workspace = Path(parts[1]).expanduser().resolve()
+                if not new_workspace.exists():
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content=f"❌ Workspace path does not exist: {new_workspace}")
+                if not new_workspace.is_dir():
+                    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                          content=f"❌ Workspace path is not a directory: {new_workspace}")
+
+                # Update workspace
+                old_workspace = self.workspace
+                self.workspace = new_workspace
+                self.context = ContextBuilder(new_workspace)
+                self.sessions = SessionManager(new_workspace)
+                self.memory_consolidator = MemoryConsolidator(
+                    workspace=new_workspace,
+                    provider=self.provider,
+                    model=self.model,
+                    sessions=self.sessions,
+                    context_window_tokens=self.context_window_tokens,
+                    build_messages=self.context.build_messages,
+                    get_tool_definitions=self.tools.get_definitions,
+                )
+
+                # Update tools with new workspace context
+                self._register_default_tools()
+
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"📂 Workspace changed from:\n  {old_workspace}\nto:\n  {new_workspace}\n\nSession reset to new workspace.")
+            else:
+                # /workspace with no path - show current workspace
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content=f"📂 Current workspace:\n{self.workspace}")
+
         if cmd == "/help":
             lines = [
                 "🐈 nanobot commands:",
                 "/new — Start a new conversation",
+                "/reset — Reset session context and start fresh",
+                "/compact — Consolidate session and clear context window",
+                "/workspace [path] — Change workspace (or show current workspace)",
                 "/stop — Stop the current task",
                 "/restart — Restart the bot",
                 "/help — Show available commands",

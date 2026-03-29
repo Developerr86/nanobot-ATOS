@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed:*)",
+      "Bash(mkdir:*)",
+      "mcp__acp__Write",
+      "mcp__acp__Edit"
+    ]
+  },
+  "autoUpdatesChannel": "latest"
+}
