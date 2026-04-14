@@ -125,15 +125,29 @@ async def check_opencode() -> dict[str, Any]:
     import shutil
     import sys
     import os
-    
-    opencode_exe = "opencode.cmd" if sys.platform == "win32" else "opencode"
-    opencode_path = shutil.which("opencode")
-    
-    if not opencode_path:
-        alt_path = Path.home() / ".local" / "share" / "opencode" / "bin" / opencode_exe
-        if alt_path.exists():
-            opencode_path = str(alt_path)
-            
+
+    opencode_path: str | None = None
+
+    if sys.platform == "win32":
+        # On Windows, shutil.which("opencode") returns the extensionless Unix
+        # shell script which cannot be executed.  Look for .cmd explicitly.
+        opencode_path = shutil.which("opencode.cmd")
+
+        # Fallback: check npm global bin directory directly
+        if not opencode_path:
+            npm_global = Path(os.environ.get("APPDATA", "")) / "npm"
+            for candidate in ["opencode.cmd", "opencode.ps1"]:
+                p = npm_global / candidate
+                if p.exists():
+                    opencode_path = str(p)
+                    break
+    else:
+        opencode_path = shutil.which("opencode")
+        if not opencode_path:
+            alt_path = Path.home() / ".local" / "share" / "opencode" / "bin" / "opencode"
+            if alt_path.exists():
+                opencode_path = str(alt_path)
+
     if not opencode_path:
         return {"available": False, "version": ""}
 
@@ -141,13 +155,14 @@ async def check_opencode() -> dict[str, Any]:
         result = subprocess.run(
             [opencode_path, "--version"],
             capture_output=True, text=True, timeout=10,
+            shell=(sys.platform == "win32"),  # shell=True needed for .cmd files
         )
         available = result.returncode == 0
         version   = result.stdout.strip() or result.stderr.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         available = False
         version   = ""
-        
+
     return {"available": available, "version": version}
 
 
@@ -261,7 +276,7 @@ async def ws_events(websocket: WebSocket) -> None:
         while True:
             await asyncio.sleep(30)
             await websocket.send_text(json.dumps({"type": "ping"}))
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         if websocket in _event_sockets:
@@ -275,7 +290,7 @@ async def ws_events(websocket: WebSocket) -> None:
 if __name__ == "__main__":
     import uvicorn
     config_arg = sys.argv[1] if len(sys.argv) > 1 else str(_CONFIG_PATH)
-    _CONFIG_PATH = Path(config_arg)
+    _CONFIG_PATH = Path(config_arg).expanduser().resolve()
     uvicorn.run(
         "nanobot.api_server:app",
         host="0.0.0.0",

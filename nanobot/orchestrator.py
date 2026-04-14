@@ -137,6 +137,16 @@ class PipelineOrchestrator:
             cfg,
             self._arch_bus,
         )
+        # Strip tools the architect must NOT have — it should plan, not code.
+        # Without write/edit/exec, the LLM is forced to produce <FINAL_SPEC>
+        # as its only mechanism to "build" something.
+        for tool_name in ("write_file", "edit_file", "exec", "spawn"):
+            if self._architect.tools.get(tool_name):
+                self._architect.tools.unregister(tool_name)
+        logger.info(
+            "@architect tools after restriction: {}",
+            self._architect.tools.tool_names,
+        )
         self._coder = _build_agent(
             "coder",
             ws_root / "coder",
@@ -401,7 +411,7 @@ class PipelineOrchestrator:
 # ---------------------------------------------------------------------------
 
 async def _main(config_path: str) -> None:
-    cfg_path = Path(config_path)
+    cfg_path = Path(config_path).expanduser().resolve()
     repo_root = Path(__file__).parent.parent.resolve()
 
     orchestrator = PipelineOrchestrator(
